@@ -174,6 +174,10 @@ function onAdvance(a) {
 function onReject(a) { if (isRecruiter.value) store.reject(a.id, a.version) }
 function onRollback(a) { if (isRecruiter.value) store.rollback(a.id, a.version) }
 
+// 入职交接联动：录用卡片展示当前交接阶段并可一键跳转入职交接页
+function onboardingOf(a) { return store.activeOnboardingOf(a.id) }
+function goOnboarding() { store.goView('onboarding') }
+
 const traceApp = computed(() => store.applications.find(a => a.id === traceAppId.value) || null)
 const traceEvents = computed(() => {
   if (!traceApp.value) return []
@@ -285,6 +289,11 @@ function weightText(weights = {}) {
               <span v-for="t in ['stage_advance','interview_conclusion','offer_issue'].map(x => pendingTaskOf(a, x)).filter(Boolean)" :key="t.id" class="appr-badge" :title="`审批 #${t.id} 等待${t.chain[t.current_step]?.role === 'hiring_manager' ? '用人经理' : t.chain[t.current_step]?.role === 'recruiter' ? '招聘负责人' : '面试官'}处理`">
                 ⏳ {{ TASK_TYPE_LABEL[t.type] }}审批中
               </span>
+              <button v-if="a.stage === 'hired'" class="onb-badge-btn" :class="{ active: !!onboardingOf(a) }"
+                :title="onboardingOf(a) ? `入职交接进行中：${onboardingOf(a).phase_label}` : '进入入职交接（资料确认→审批→报到→试用交接）'"
+                @click="goOnboarding">
+                {{ onboardingOf(a) ? `🧳 交接·${onboardingOf(a).phase_label}` : '🧳 办理入职交接' }}
+              </button>
             </div>
             <div class="kfoot">
               <span class="muted">{{ a.city }}<template v-if="a.stage !== 'submitted'"> · v{{ a.version }}</template></span>
@@ -479,6 +488,9 @@ function weightText(weights = {}) {
 .iv-badge em { font-style: normal; opacity: .7; }
 .of-badge { font-size: 10px; border-radius: 9px; padding: 2px 7px; border: 1px solid; background: var(--panel2); }
 .appr-badge { font-size: 10px; border-radius: 9px; padding: 2px 7px; border: 1px solid rgba(255,209,102,.45); color: var(--accent2); background: rgba(255,209,102,.1); }
+.onb-badge-btn { font-size: 10px; border-radius: 9px; padding: 2px 8px; border: 1px solid rgba(87,214,160,.45); color: var(--green); background: rgba(87,214,160,.08); cursor: pointer; }
+.onb-badge-btn.active { box-shadow: 0 0 0 2px rgba(87,214,160,.12); }
+.onb-badge-btn:hover { background: rgba(87,214,160,.18); }
 .rejected-lane { padding: 0; overflow: hidden; }
 .rl-head { display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; cursor: pointer; user-select: none; }
 .rl-head b { font-size: 14px; display: flex; align-items: center; gap: 8px; }

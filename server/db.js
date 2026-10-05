@@ -424,6 +424,69 @@ CREATE TABLE IF NOT EXISTS appointment_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_appt_msgs_appt ON appointment_messages(appointment_id, id);
 
+-- ---------------- 候选人入职交接模块 ----------------
+-- 入职交接主单：已录用（Offer 已接受）候选人经 资料确认→审批→报到→试用交接 四阶段；
+-- 同一应聘同时只允许一条进行中的交接单（部分唯一索引兜底），撤销/中止后可重新发起
+CREATE TABLE IF NOT EXISTS onboardings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  candidate_id INTEGER NOT NULL DEFAULT 0,
+  position_id INTEGER NOT NULL DEFAULT 0,
+  phase TEXT NOT NULL DEFAULT 'profile', -- profile/approval/checkin/handover/done/cancelled
+  approval_status TEXT NOT NULL DEFAULT '',       -- approval 阶段：pending/returned/approved
+  profile_snapshot TEXT NOT NULL DEFAULT '{}',    -- 资料确认快照（个人信息 + 材料清单 JSON）
+  entry_date TEXT NOT NULL DEFAULT '',            -- 约定入职日期 YYYY-MM-DD
+  submitted_by TEXT NOT NULL DEFAULT '',
+  submitted_by_name TEXT NOT NULL DEFAULT '',
+  submitted_at TEXT NOT NULL DEFAULT '',
+  decided_by TEXT NOT NULL DEFAULT '',
+  decided_by_name TEXT NOT NULL DEFAULT '',
+  decided_at TEXT NOT NULL DEFAULT '',
+  decide_note TEXT NOT NULL DEFAULT '',
+  checkin_at TEXT NOT NULL DEFAULT '',            -- 实际报到时间
+  checkin_by TEXT NOT NULL DEFAULT '',
+  checkin_by_name TEXT NOT NULL DEFAULT '',
+  checkin_note TEXT NOT NULL DEFAULT '',
+  noshow_reason TEXT NOT NULL DEFAULT '',
+  handover_items TEXT NOT NULL DEFAULT '[]',      -- 试用交接清单 JSON（导师/账号/设备/培训等）
+  probation_end TEXT NOT NULL DEFAULT '',         -- 试用截止日期
+  completed_at TEXT NOT NULL DEFAULT '',
+  completed_by TEXT NOT NULL DEFAULT '',
+  completed_by_name TEXT NOT NULL DEFAULT '',
+  completion_note TEXT NOT NULL DEFAULT '',
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT NOT NULL DEFAULT '',
+  cancelled_by TEXT NOT NULL DEFAULT '',
+  cancelled_by_name TEXT NOT NULL DEFAULT '',
+  cancel_kind TEXT NOT NULL DEFAULT '',           -- cancel=主动撤销 / system=已录用流程回退被动中止
+  backfilled INTEGER NOT NULL DEFAULT 0,          -- 历史已入职数据补录
+  created_by TEXT NOT NULL DEFAULT '',
+  created_by_name TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_onboard_app ON onboardings(application_id, id);
+-- 进行中（四阶段内）的交接单同一应聘唯一；done/cancelled 后允许重新发起新单
+CREATE UNIQUE INDEX IF NOT EXISTS idx_onboard_app_active
+  ON onboardings(application_id) WHERE phase IN ('profile','approval','checkin','handover');
+
+-- 交接过程留痕：资料确认/提交审批/通过退回/报到/交接事项/完成/撤销/系统中止，只追加不改写
+CREATE TABLE IF NOT EXISTS onboarding_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  onboarding_id INTEGER NOT NULL,
+  phase TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,                    -- create/profile_update/candidate_confirm/submit/approve/return/resubmit/checkin/no_show/handover_update/complete/cancel/system_cancel/migrate
+  party TEXT NOT NULL DEFAULT 'system',    -- candidate/recruiter/hiring_manager/system
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  actor_role TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_onb_events_onb ON onboarding_events(onboarding_id, id);
+
 -- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
 CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
 BEFORE UPDATE ON crisis_audit_entries

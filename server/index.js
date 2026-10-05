@@ -4,6 +4,9 @@ import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
 import { router as scheduleRouter, getScheduleState } from './schedule.js'
+import {
+  router as onboardingRouter, bindOnboardingCore, cancelOnboardingForApp, getOnboardingState
+} from './onboarding.js'
 
 const app = express()
 app.use(express.json())
@@ -452,7 +455,8 @@ app.get('/api/state', (req, res) => {
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
     ...getCrisisState(),
-    ...getScheduleState()
+    ...getScheduleState(),
+    ...getOnboardingState()
   })
 })
 
@@ -710,7 +714,11 @@ function rollbackStage(app, { operator, expectedVersion, reason = '' }) {
   if (!target) badRequest('投递阶段无法继续回退', 'rollback_first_stage')
   // 从 Offer 阶段回退：进行中/已接受的 Offer 必须撤回，避免 Offer 页与流程页口径不一致
   if (app.stage === 'offer') withdrawActiveOffer(app, { operator, reason })
-  if (app.stage === 'hired') withdrawAcceptedOffer(app, { operator, reason })
+  if (app.stage === 'hired') {
+    withdrawAcceptedOffer(app, { operator, reason })
+    // 录用异常回退：进行中的入职交接同事务被动中止
+    cancelOnboardingForApp(app.id, { reason: `已录用流程异常回退：${reason || '回退至 Offer 阶段'}`, actor: { id: '', name: operator || 'HR-Sandy', role: 'recruiter' } })
+  }
   return moveStage(app, target, { eventType: 'rollback', operator, fromStage: app.stage })
 }
 
@@ -749,6 +757,25 @@ function withdrawAcceptedOffer(app, { operator, reason }) {
   })
   of.status = 'withdrawn'
   return of
+}
+
+// Offer「确认入职」核心：accepted → joined 并写 join 留痕；未处于 hired 的应用同步推进（固化阶段事件）。
+// 已是 joined 时幂等返回。供「Offer 变更端点」与「入职交接·确认报到的执行回写」共用，
+// 保证报到回写与直接确认入职走完全相同的状态机路径（Offer 页/流程看板/入职交接三处口径一致）
+function markOfferJoined(app, { operator, note = '' } = {}) {
+  const of = offerOfApp(app.id)
+  if (!of) badRequest('该候选人没有 Offer 记录，无法确认入职', 'offer_missing')
+  if (of.status === 'joined') return { idempotent: true, version: num(app.version), offerId: of.id }
+  if (of.status !== 'accepted') badRequest(`Offer 当前为「${of.status}」状态，不能确认入职`, 'offer_not_accepted')
+  const stamp = ts()
+  operator = operator || app.recruiter || 'HR-Sandy'
+  db.prepare('UPDATE offers SET status=?, joined_at=COALESCE(NULLIF(joined_at,\'\'),?), decided_at=? WHERE id=?')
+    .run('joined', stamp, stamp, of.id)
+  addOfferLog({ offerId: of.id, applicationId: app.id, changeType: 'join', of: { ...of, status: 'accepted' }, toStatus: 'joined', operator, note })
+  let moved = null
+  if (app.stage !== 'hired') moved = moveStage(app, 'hired', { eventType: 'offer_accepted', operator, fromStage: app.stage })
+  of.status = 'joined'
+  return { idempotent: false, version: num(app.version), offerId: of.id, moved: !!moved }
 }
 
 app.post('/api/applications', (req, res) => {
@@ -1074,10 +1101,8 @@ app.post('/api/offers/:id', (req, res, next) => {
             moved = moveStage(a, 'hired', { eventType: 'offer_accepted', operator, fromStage: a.stage })
           }
         } else if (s === 'joined') {
-          db.prepare('UPDATE offers SET status=?, joined_at=COALESCE(NULLIF(joined_at,\'\'),?), decided_at=? WHERE id=?')
-            .run('joined', stamp, stamp, offerId)
-          addOfferLog({ offerId, applicationId: a.id, changeType: 'join', of: { ...of, status: 'accepted' }, toStatus: 'joined', operator, note: b.note || '' })
-          if (a.stage !== 'hired') moved = moveStage(a, 'hired', { eventType: 'offer_accepted', operator, fromStage: a.stage })
+          // 复用统一的「确认入职」状态机（与入职交接·确认报到回写同源）
+          markOfferJoined(a, { operator, note: b.note || '' })
         } else if (s === 'rejected') {
           db.prepare('UPDATE offers SET status=?, decided_at=?, decided_by=? WHERE id=?').run('rejected', stamp, operator, offerId)
           addOfferLog({ offerId, applicationId: a.id, changeType: 'reject', of, toStatus: 'rejected', operator, note: b.note || '' })
@@ -1087,11 +1112,17 @@ app.post('/api/offers/:id', (req, res, next) => {
             db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, a.id)
           }
         } else if (s === 'withdrawn') {
+          const hiredBefore = a.stage === 'hired'
+          const acceptedBefore = of.status === 'accepted'
           db.prepare('UPDATE offers SET status=?, decided_at=?, decided_by=?, note=? WHERE id=?')
             .run('withdrawn', stamp, operator, b.note || of.note, offerId)
           addOfferLog({ offerId, applicationId: a.id, changeType: 'withdraw', of, toStatus: 'withdrawn', operator, note: b.note || '' })
           // 已接受/已入职后撤回：录用阶段同步回退到 Offer（单步回退，事件留痕）
-          if (a.stage === 'hired') moved = moveStage(a, 'offer', { eventType: 'rollback', operator, fromStage: 'hired' })
+          if (hiredBefore) moved = moveStage(a, 'offer', { eventType: 'rollback', operator, fromStage: 'hired' })
+          // 已录用流程回退：同事务被动中止进行中的入职交接（通知/上链与业务一起提交或回滚）
+          if (hiredBefore || acceptedBefore) {
+            cancelOnboardingForApp(a.id, { reason: `Offer 撤回：${b.note || of.note || 'HR 撤回 Offer'}`, actor: { id: '', name: operator, role: 'recruiter' } })
+          }
         }
       }
       return { ok: true, status: b.status || of.status, stage: a.stage, version: num(a.version), moved: !!moved }
@@ -1512,6 +1543,9 @@ bindCrisisCore({ rollbackForIncident })
 app.use('/api/crisis', crisisRouter)
 // 候选人↔面试官双向预约沟通（可用时段/双向确认改期/提醒/缺席处理）
 app.use('/api/schedule', scheduleRouter)
+// 候选人入职交接（资料确认→审批→报到→试用交接；报到回写已录用流程）
+bindOnboardingCore({ markOfferJoined })
+app.use('/api/onboardings', onboardingRouter)
 
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import { useHrStore } from '@/store/hr'
 import OverviewView from '@/components/OverviewView.vue'
 import PositionsView from '@/components/PositionsView.vue'
@@ -12,6 +12,7 @@ import OfferView from '@/components/OfferView.vue'
 import ApprovalView from '@/components/ApprovalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
 import CrisisView from '@/components/CrisisView.vue'
+import OnboardingView from '@/components/OnboardingView.vue'
 
 const store = useHrStore()
 const view = ref('overview')
@@ -26,6 +27,7 @@ const navs = [
   { k: 'interview', icon: '💬', label: '面试管理' },
   { k: 'schedule', icon: '📅', label: '预约沟通' },
   { k: 'offer', icon: '📄', label: 'Offer 管理' },
+  { k: 'onboarding', icon: '🧳', label: '入职交接' },
   { k: 'approval', icon: '✅', label: '审批中心' },
   { k: 'crisis', icon: '🛡️', label: '危机审计' },
   { k: 'reports', icon: '📈', label: '报表中心' }
@@ -44,7 +46,10 @@ const notifyIcon = {
   sched_reschedule_request: '🔁', sched_reschedule_rejected: '↩️',
   sched_declined: '🚫', sched_cancelled: '❌', sched_completed: '🎉',
   sched_noshow: '⚠️', sched_rebooked: '🔄',
-  sched_remind_24h: '⏰', sched_remind_1h: '🔔', sched_remind: '📣'
+  sched_remind_24h: '⏰', sched_remind_1h: '🔔', sched_remind: '📣',
+  onb_profile_started: '📋', onb_submitted: '🧳', onb_resubmitted: '🔁',
+  onb_returned: '↩️', onb_approved: '✅', onb_checkin: '🏢',
+  onb_noshow: '⚠️', onb_completed: '🎉', onb_cancelled: '🚫'
 }
 
 function onSwitchUser(e) {
@@ -63,10 +68,14 @@ function openNotify(n) {
   showNotify.value = false
   if (String(n?.type || '').startsWith('crisis_')) view.value = 'crisis'
   else if (String(n?.type || '').startsWith('sched_')) view.value = 'schedule'
+  else if (String(n?.type || '').startsWith('onb_')) view.value = 'onboarding'
   else view.value = 'approval'
 }
 
 onMounted(store.refresh)
+
+// 跨页导航（Offer/流程页 → 入职交接）
+watch(() => store.requestedView, v => { if (v) { view.value = v; store.requestedView = '' } })
 </script>
 
 <template>
@@ -85,6 +94,9 @@ onMounted(store.refresh)
             </em>
             <em v-else-if="n.k === 'schedule' && store.scheduleTodoCount" class="nav-badge sched-badge">
               {{ store.scheduleTodoCount }}
+            </em>
+            <em v-else-if="n.k === 'onboarding' && store.onboardingTodoCount" class="nav-badge onb-badge">
+              {{ store.onboardingTodoCount }}
             </em>
           </button>
       </nav>
@@ -145,6 +157,7 @@ onMounted(store.refresh)
         <InterviewView v-else-if="view === 'interview'" />
         <ScheduleView v-else-if="view === 'schedule'" />
         <OfferView v-else-if="view === 'offer'" />
+        <OnboardingView v-else-if="view === 'onboarding'" />
         <ApprovalView v-else-if="view === 'approval'" />
         <CrisisView v-else-if="view === 'crisis'" />
         <ReportsView v-else />
@@ -182,6 +195,7 @@ main { flex: 1; min-width: 0; }
 .nav-badge { margin-left: auto; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
 .nav-badge.crisis-badge { background: var(--purple); }
 .nav-badge.sched-badge { background: var(--accent2); color: #1a1400; }
+.nav-badge.onb-badge { background: var(--green); color: #06231a; }
 .idzone { display: flex; align-items: center; gap: 10px; }
 .idchip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 6px 4px 12px; font-size: 13px; }
 .idchip select { border: none; background: transparent; padding: 3px 4px; font-size: 13px; }

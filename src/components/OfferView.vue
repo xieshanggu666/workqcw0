@@ -51,6 +51,12 @@ function withdraw(a) {
   store.updateOffer(a.offer.id, { status: 'withdrawn', version: a.version, note: 'HR 撤回 Offer' }, 'Offer 已撤回')
 }
 
+// 入职交接联动：已接受（=已录用）候选人可进入四阶段入职交接
+function onboardingOf(a) {
+  return store.activeOnboardingOf(a.id)
+}
+function goOnboarding() { store.goView('onboarding') }
+
 const ofStatus = s => ({
   pending: ['⏳', '待回应', 'var(--accent2)'], accepted: ['✅', '已接受', 'var(--green)'],
   rejected: ['❌', '已拒绝', 'var(--red)'], joined: ['🎉', '已入职', 'var(--green)'],
@@ -104,10 +110,19 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
                 <button class="primary sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'rejected')">拒绝</button>
                 <button class="warn sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="withdraw(a)">撤回</button>
               </template>
-              <!-- 已接受（=录用待入职）：确认入职或撤回 -->
+              <!-- 已接受（=录用待入职）：确认入职或撤回；入职交接在「入职交接」页办理 -->
               <template v-else-if="a.offer.status === 'accepted'">
-                <button class="primary sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'joined')">确认入职</button>
+                <button class="succ sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'joined')">确认入职</button>
                 <button class="warn sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="withdraw(a)">撤回</button>
+                <button class="ghost sm onb-btn" @click="goOnboarding">
+                  {{ onboardingOf(a) ? `🧳 交接中（${onboardingOf(a).phase_label}）` : '🧳 入职交接' }}
+                </button>
+              </template>
+              <!-- 已入职：查看/补办入职交接（报到确认会自动把 Offer 回写为已入职） -->
+              <template v-else-if="a.offer.status === 'joined'">
+                <button class="ghost sm onb-btn" @click="goOnboarding">
+                  {{ onboardingOf(a) ? `🧳 交接中（${onboardingOf(a).phase_label}）` : '🧳 入职交接' }}
+                </button>
               </template>
               <!-- 已撤回/已拒绝：在 Offer 阶段时可重新发起 -->
               <button v-else-if="['withdrawn','rejected'].includes(a.offer.status) && a.stage === 'offer'" class="succ sm" @click="openMake(a)">重新发起</button>
@@ -180,4 +195,5 @@ button.sm { font-size: 11px; padding: 4px 9px; }
 .old-salary { font-size: 12px; margin-bottom: 8px; }
 .appr-pending-chip { font-size: 11px; color: var(--accent2); background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.4); border-radius: 10px; padding: 3px 9px; white-space: nowrap; }
 .band-tip { font-size: 12px; color: var(--accent2); background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.35); border-radius: 8px; padding: 7px 10px; margin-bottom: 12px; }
+.onb-btn { color: var(--green); border-color: rgba(87,214,160,.45); }
 </style>

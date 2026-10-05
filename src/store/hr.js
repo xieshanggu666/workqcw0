@@ -22,6 +22,8 @@ export const useHrStore = defineStore('hr', {
     data: null,
     loaded: false,
     userId: currentUserId,
+    // 跨页面导航请求（goView 设置，App.vue watch 后消费）
+    requestedView: '',
     // 全局轻提示：服务端 4xx 约束（重复操作/状态冲突/乐观锁）统一在此提示，保证各页面口径一致
     toast: null,
     // 进行中的操作键（如 advance:3）：按钮置灰，防止重复点击/并发提交
@@ -52,6 +54,9 @@ export const useHrStore = defineStore('hr', {
     // 候选人↔面试官双向预约
     scheduleSlots: s => s.data?.slots || [],
     appointments: s => s.data?.appointments || [],
+    // 候选人入职交接
+    onboardings: s => s.data?.onboardings || [],
+    onboardingMeta: s => s.data?.onboardingMeta || { phases: [], actionLabels: {}, partyLabels: {}, defaultMaterials: [], defaultHandover: [] },
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -85,7 +90,23 @@ export const useHrStore = defineStore('hr', {
         }
         return false
       }).length
-    }
+    },
+    // 入职交接待办：招聘负责人=资料确认/重提/待报到/试用中需登记；用人经理=待审批
+    onboardingTodoCount() {
+      return this.onboardings.filter(ob => {
+        if (this.myRole === 'recruiter') {
+          return ob.phase === 'profile' || ob.phase === 'checkin'
+        }
+        if (this.myRole === 'hiring_manager') {
+          return ob.phase === 'approval' && ob.approval_status === 'pending'
+        }
+        return false
+      }).length
+    },
+    // 某应聘进行中的入职交接单（无则 null）
+    activeOnboardingOf: s => appId =>
+      (s.data?.onboardings || []).find(ob => ob.application_id === appId &&
+        ['profile', 'approval', 'checkin', 'handover'].includes(ob.phase)) || null
   },
   actions: {
     notify(type, msg) {
@@ -93,9 +114,10 @@ export const useHrStore = defineStore('hr', {
       if (this._toastTimer) clearTimeout(this._toastTimer)
       this._toastTimer = setTimeout(() => { this.toast = null }, 3600)
     },
+    // 跨页导航：如 Offer 页/流程看板点击「入职交接」跳到入职交接页（App.vue 监听）
+    goView(view) { this.requestedView = view },
     // 串行化同一键的操作：重复触发直接复用进行中的 Promise，杜绝重复提交
-    async runBusy(key, fn) {
-      if (this.pending[key]) return this.pending[key]
+    async runBusy(key, fn) {      if (this.pending[key]) return this.pending[key]
       const p = Promise.resolve().then(fn)
       this.pending = { ...this.pending, [key]: p }
       try {
@@ -363,6 +385,56 @@ export const useHrStore = defineStore('hr', {
         await this.refresh()
         return r
       } catch (e) { this.notify('error', e.message); return null }
+    },
+    // ---------------- 候选人入职交接 ----------------
+    startOnboarding(applicationId, entryDate, note) {
+      return this.runBusy(`onb-new:${applicationId}`, () =>
+        this.api('POST', '/onboardings', { application_id: applicationId, entry_date: entryDate, note },
+          { success: '入职交接已发起，进入资料确认' }))
+    },
+    updateOnboardingProfile(id, payload) {
+      return this.runBusy(`onb-profile:${id}`, () =>
+        this.api('PUT', `/onboardings/${id}/profile`, payload))
+    },
+    confirmOnboardingMaterials(id) {
+      return this.runBusy(`onb-confirm:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/confirm-materials`, {}, { success: '已登记候选人确认全部资料' }))
+    },
+    submitOnboarding(id) {
+      return this.runBusy(`onb-submit:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/submit`, {}, { success: '入职审批已提交，待用人经理审批' }))
+    },
+    resubmitOnboarding(id) {
+      return this.runBusy(`onb-submit:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/resubmit`, {}, { success: '已修改并重新提交入职审批' }))
+    },
+    decideOnboarding(id, payload) {
+      return this.runBusy(`onb-decide:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/decide`, payload,
+          payload.action === 'approve' ? { success: '入职审批已通过，等待候选人报到' } : { success: '已退回招聘负责人补充资料' }))
+    },
+    checkinOnboarding(id, payload) {
+      return this.runBusy(`onb-checkin:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/checkin`, payload,
+          { success: '报到已确认，Offer 已回写为已入职，进入试用交接' }))
+    },
+    noShowOnboarding(id, reason, version) {
+      return this.runBusy(`onb-noshow:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/no-show`, { reason, version },
+          { success: '已登记未报到，交接中止（Offer 未自动撤回）' }))
+    },
+    updateHandover(id, payload) {
+      return this.runBusy(`onb-handover:${id}:${Date.now()}`, () =>
+        this.api('PUT', `/onboardings/${id}/handover`, payload))
+    },
+    completeOnboarding(id, version, note) {
+      return this.runBusy(`onb-complete:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/complete`, { version, note },
+          { success: '试用交接完成，入职流程闭环 🎉' }))
+    },
+    cancelOnboarding(id, reason) {
+      return this.runBusy(`onb-cancel:${id}`, () =>
+        this.api('POST', `/onboardings/${id}/cancel`, { reason }, { success: '入职交接已撤销' }))
     }
   }
 })
