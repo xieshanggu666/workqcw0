@@ -424,6 +424,57 @@ CREATE TABLE IF NOT EXISTS appointment_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_appt_msgs_appt ON appointment_messages(appointment_id, id);
 
+-- ---------------- 候选人入职交接模块 ----------------
+-- 一个应聘仅允许一条「有效」交接（部分唯一索引，cancelled 历史保留，可重新发起）
+-- 四阶段：material 资料确认 → approval 交接审批（approval_tasks 复用审批链）→ report 报到 → handover 试用交接
+CREATE TABLE IF NOT EXISTS onboardings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'material', -- material/approval/report/handover/completed/cancelled
+  -- 阶段一：资料确认（候选人侧操作由招聘负责人电话/短信确认后代为执行）
+  material_items TEXT NOT NULL DEFAULT '[]',   -- [{key,label,confirmed,by,at}]
+  material_note TEXT NOT NULL DEFAULT '',
+  candidate_confirmed INTEGER NOT NULL DEFAULT 0,  -- 候选人确认位：全部资料经本人确认无误
+  candidate_confirmed_at TEXT NOT NULL DEFAULT '',
+  expected_onboard_at TEXT NOT NULL DEFAULT '',    -- 预计报到时间
+  -- 阶段二：审批（复用 approval_tasks，onboarding_start 类型：招聘负责人 → 用人经理）
+  approval_task_id INTEGER NOT NULL DEFAULT 0,
+  -- 阶段三：报到（确认报到同事务把 Offer 回写为 joined，延期次数累加留痕）
+  report_at TEXT NOT NULL DEFAULT '',
+  report_note TEXT NOT NULL DEFAULT '',
+  delay_count INTEGER NOT NULL DEFAULT 0,
+  -- 阶段四：试用交接（招聘负责人备齐 → 用人经理逐项确认 → 完成）
+  handover_items TEXT NOT NULL DEFAULT '[]',  -- [{key,label,ready,ready_by,ready_at,confirmed,confirmed_by,confirmed_at,note}]
+  handover_note TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  cancel_reason TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1
+);
+
+-- 交接操作留痕：发起/资料确认/提交审批/审批结果/报到/延期/备齐/确认/完成/取消，只追加不改写
+CREATE TABLE IF NOT EXISTS onboarding_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  onboarding_id INTEGER NOT NULL,
+  application_id INTEGER NOT NULL DEFAULT 0,
+  phase TEXT NOT NULL DEFAULT '',       -- material/approval/report/handover
+  action TEXT NOT NULL DEFAULT '',      -- start/material_update/submit/approve/return/resubmit/cancel_task/report/delay/ready/confirm/complete/cancel
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  actor_role TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_onboarding_logs_ob ON onboarding_logs(onboarding_id, id);
+CREATE INDEX IF NOT EXISTS idx_onboarding_logs_app ON onboarding_logs(application_id, id);
+-- 有效交接唯一（模块为新表，无历史重复；cancelled 行不占用唯一名额，允许重新发起）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_onboarding_live_once
+  ON onboardings(application_id) WHERE status!='cancelled';
+
 -- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
 CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
 BEFORE UPDATE ON crisis_audit_entries
@@ -643,6 +694,76 @@ function seedSchedule() {
   }
 }
 seedSchedule()
+
+// ---------------- 入职交接模块演示数据（仅空库时播种） ----------------
+// 补两条「录用」演示应聘：一条已完成报到（交接进行中），一条已接受 Offer（待发起交接），
+// 阶段事件由服务端启动时的 migrateHistory 统一补录（标记补录），与既有模块演示数据口径一致
+function seedOnboarding() {
+  const obCount = db.prepare('SELECT COUNT(*) c FROM onboardings').get().c
+  if (obCount > 0) return
+
+  const MATERIAL = (all) => JSON.stringify([
+    { key: 'identity', label: '身份证/学历证明', confirmed: 1 },
+    { key: 'resume', label: '纸质简历与照片', confirmed: 1 },
+    { key: 'offer_letter', label: 'Offer 回执签字', confirmed: 1 },
+    { key: 'bank', label: '银行卡与社保信息', confirmed: all ? 1 : 0 },
+    { key: 'physical', label: '入职体检报告', confirmed: all ? 1 : 0 },
+    { key: 'release', label: '离职证明', confirmed: all ? 1 : 0 }
+  ])
+  const HANDOVER = (readyAll) => JSON.stringify([
+    { key: 'account', label: '账号与权限开通（邮箱/代码库/内部系统）', ready: 1, confirmed: 1 },
+    { key: 'equipment', label: '办公设备与工位准备', ready: 1, confirmed: 1 },
+    { key: 'mentor', label: '导师/带教安排', ready: readyAll ? 1 : 0, confirmed: 0 },
+    { key: 'training', label: '入职培训日程', ready: readyAll ? 1 : 0, confirmed: 0 },
+    { key: 'plan', label: '试用期目标与考核计划', ready: 0, confirmed: 0 }
+  ])
+
+  const ensureHiredApp = (pid, cid, joined) => {
+    const exist = db.prepare('SELECT id FROM applications WHERE position_id=? AND candidate_id=?').get(pid, cid)
+    if (exist) return exist.id
+    const stamp = ts()
+    const r = db.prepare(`INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,version)
+                          VALUES(?,?,'hired',?,'HR-Sandy',1)`).run(pid, cid, stamp)
+    const appId = Number(r.lastInsertRowid)
+    const of = db.prepare(`INSERT INTO offers(application_id,salary,status,due,note,decided_at,decided_by,joined_at)
+                           VALUES(?,?,?,?,?,?,?,?)`)
+      .run(appId, joined ? 36000 : 25000, joined ? 'joined' : 'accepted', stamp, '录用确认',
+        stamp, 'HR-Sandy', joined ? stamp : '')
+    const offerId = Number(of.lastInsertRowid)
+    const iLog = db.prepare(`INSERT INTO offer_change_logs(offer_id,application_id,change_type,from_status,to_status,from_salary,to_salary,changed_at,operator,note)
+                             VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    iLog.run(offerId, appId, 'create', '', 'pending', 0, joined ? 36000 : 25000, stamp, 'HR-Sandy', '演示数据')
+    iLog.run(offerId, appId, 'accept', 'pending', 'accepted', joined ? 36000 : 25000, joined ? 36000 : 25000, stamp, 'HR-Sandy', '候选人接受')
+    if (joined) iLog.run(offerId, appId, 'join', 'accepted', 'joined', 36000, 36000, stamp, 'HR-Sandy', '确认报到')
+    return appId
+  }
+
+  const stamp = ts()
+  // ① 黄梦琪（产品经理）：报到完成，试用交接中（用人经理已确认 2 项，其余待招聘负责人备齐）
+  const appJoined = ensureHiredApp(3, 6, true)
+  const r1 = db.prepare(`INSERT INTO onboardings
+    (application_id,status,material_items,candidate_confirmed,candidate_confirmed_at,expected_onboard_at,
+     approval_task_id,report_at,delay_count,handover_items,created_by,created_at,updated_at,version)
+    VALUES(?, 'handover', ?,1,?, ?,0,?,0,?, 'u-sandy',?,?,1)`)
+    .run(appJoined, MATERIAL(true), stamp, stamp, stamp, HANDOVER(true), stamp, stamp)
+  const ob1 = Number(r1.lastInsertRowid)
+  const iOLog = db.prepare(`INSERT INTO onboarding_logs(onboarding_id,application_id,phase,action,actor_id,actor_name,actor_role,content,detail,created_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?)`)
+  ;[
+    ['material', 'start', 'u-sandy', 'Sandy 陈', 'recruiter', '发起入职交接，进入资料确认', '{}'],
+    ['material', 'material_update', 'u-sandy', 'Sandy 陈', 'recruiter', '入职资料已逐项确认（候选人电话确认无误）', '{}'],
+    ['approval', 'submit', 'u-sandy', 'Sandy 陈', 'recruiter', '提交入职交接审批（用人经理）', '{}'],
+    ['approval', 'approve', 'u-wang', '王经理', 'hiring_manager', '用人经理审批通过', '{}'],
+    ['report', 'report', 'u-sandy', 'Sandy 陈', 'recruiter', '候选人已报到，Offer 回写为已入职', '{}'],
+    ['handover', 'ready', 'u-sandy', 'Sandy 陈', 'recruiter', '招聘负责人备齐交接项', '{}'],
+    ['handover', 'confirm', 'u-wang', '王经理', 'hiring_manager', '用人经理确认：账号与权限、办公设备', '{}']
+  ].forEach(([phase, action, aid, aname, role, content, detail]) =>
+    iOLog.run(ob1, appJoined, phase, action, aid, aname, role, content, detail, stamp))
+
+  // ② 吴雅琴（UI 设计师）：已接受 Offer，尚未发起交接（页面上可对其「发起交接」）
+  ensureHiredApp(4, 8, false)
+}
+seedOnboarding()
 
 export default db
 export { now, ts, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP }

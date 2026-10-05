@@ -24,6 +24,8 @@ const appByStage = computed(() => {
 const hiredCount = computed(() => store.applications.filter(a => a.stage === 'hired').length)
 const joinedCount = computed(() => store.offers.filter(o => o.status === 'joined').length)
 const pendingOffer = computed(() => store.offers.filter(o => o.status === 'pending').length)
+const onboardingActive = computed(() => (store.onboardings || []).filter(o => o.active).length)
+const onboardingCompleted = computed(() => (store.onboardings || []).filter(o => o.status === 'completed').length)
 
 const pipeline = computed(() => ['submitted', 'screening', 'interview', 'offer', 'hired'].map((s, i) => ({
   stage: s, label: stageMeta[s].label, color: stageMeta[s].color, count: appByStage.value[s] || 0
@@ -64,6 +66,8 @@ const channelCount = computed(() => {
       <div class="card stat"><span>🎉</span><b class="money">{{ joinedCount }}</b><em>已入职</em></div>
       <div class="card stat"><span>⏱️</span><b>{{ Math.max(1, store.applications.filter(a => !['hired','rejected'].includes(a.stage)).length) }}</b><em>流程在途</em></div>
       <div class="card stat"><span>📄</span><b>{{ pendingOffer }}</b><em>待回应 Offer</em></div>
+      <div class="card stat"><span>🧳</span><b>{{ onboardingActive }}</b><em>入职交接进行中</em></div>
+      <div class="card stat"><span>🤝</span><b>{{ onboardingCompleted }}</b><em>交接完成（已转正试用）</em></div>
     </div>
 
     <div class="row">

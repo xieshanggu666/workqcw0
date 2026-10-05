@@ -171,6 +171,9 @@ function onAdvance(a) {
   const target = nextStage(a.stage)
   store.submitApproval({ type: 'stage_advance', application_id: a.id, payload: { target_stage: target } })
 }
+// 录用阶段的入职交接进度（后端随应聘记录附带的精简引用）
+const OB_STATUS_LABEL = { material: '资料确认', approval: '审批中', report: '待报到', handover: '试用交接', completed: '已完成', cancelled: '已取消' }
+function obLabel(s) { return OB_STATUS_LABEL[s] || s }
 function onReject(a) { if (isRecruiter.value) store.reject(a.id, a.version) }
 function onRollback(a) { if (isRecruiter.value) store.rollback(a.id, a.version) }
 
@@ -296,7 +299,10 @@ function weightText(weights = {}) {
                     {{ pendingTaskOf(a, 'stage_advance') ? '⏳ 审批中' : isBusy(a) ? '处理中…' : `提请 → ${nextStageLabel(a.stage)}` }}
                   </button>
                 </template>
-                <span v-else-if="a.offer?.status === 'accepted'" class="succ-chip">✅ 已录用（待入职）</span>
+                <span v-else-if="a.offer?.status === 'accepted' && !a.onboarding" class="succ-chip">✅ 已录用（待入职/待发起交接）</span>
+                <button v-else-if="a.onboarding" class="trace-btn ob-link" @click="store.goView('onboarding')">
+                  🧳 交接：{{ obLabel(a.onboarding.status) }}
+                </button>
                 <span v-else class="succ-chip">🎉 已入职</span>
                 <button class="danger" v-if="a.stage !== 'hired'" :disabled="isBusy(a) || !isRecruiter"
                   :title="isRecruiter ? '' : '需切换为「招聘负责人」身份'" @click="onReject(a)">淘汰</button>
@@ -491,6 +497,7 @@ function weightText(weights = {}) {
 .rl-acts { display: flex; gap: 6px; }
 .rl-acts button { font-size: 11px; padding: 4px 9px; }
 .succ-chip { color: var(--green); font-size: 12px; }
+.ob-link { color: var(--green); border-color: rgba(87,214,160,.45); background: rgba(87,214,160,.08); }
 .empty-mini { font-size: 12px; padding: 10px; text-align: center; }
 .modal { position: fixed; inset: 0; background: rgba(4,8,18,.68); z-index: 50; display: flex; justify-content: flex-end; }
 .trace-box { width: min(680px, 100%); height: 100%; border-radius: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }

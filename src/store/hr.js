@@ -24,6 +24,8 @@ export const useHrStore = defineStore('hr', {
     userId: currentUserId,
     // 全局轻提示：服务端 4xx 约束（重复操作/状态冲突/乐观锁）统一在此提示，保证各页面口径一致
     toast: null,
+    // 跨页面导航请求：通知铃铛/Offer 页等可请求主布局切到指定视图
+    pendingView: null,
     // 进行中的操作键（如 advance:3）：按钮置灰，防止重复点击/并发提交
     pending: {}
   }),
@@ -52,6 +54,8 @@ export const useHrStore = defineStore('hr', {
     // 候选人↔面试官双向预约
     scheduleSlots: s => s.data?.slots || [],
     appointments: s => s.data?.appointments || [],
+    // 候选人入职交接
+    onboardings: s => s.data?.onboardings || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -85,6 +89,26 @@ export const useHrStore = defineStore('hr', {
         }
         return false
       }).length
+    },
+    // 入职交接待办：
+    //  招聘负责人 = 待确认资料 / 待报到 / 有备齐中的交接（完成态不计）
+    //  用人经理 = 待确认交接项（审批待办已计入审批中心红点，这里不重复计数）
+    onboardingTodoCount() {
+      const role = this.myRole
+      return this.onboardings.filter(o => {
+        if (!o.active) return false
+        if (role === 'recruiter') {
+          return ['material', 'approval', 'report'].includes(o.status) ||
+            (o.status === 'handover' && o.ready_count < o.handover_total)
+        }
+        if (role === 'hiring_manager') {
+          return o.status === 'handover' && o.confirmed_count < o.handover_total
+        }
+        return false
+      }).length
+    },
+    activeOnboardingOf(appId) {
+      return this.onboardings.find(o => o.application_id === appId && o.active) || null
     }
   },
   actions: {
@@ -93,6 +117,8 @@ export const useHrStore = defineStore('hr', {
       if (this._toastTimer) clearTimeout(this._toastTimer)
       this._toastTimer = setTimeout(() => { this.toast = null }, 3600)
     },
+    // 请求主布局切换视图（Offer/审批/通知等跨页面入口共用）
+    goView(v) { this.pendingView = v },
     // 串行化同一键的操作：重复触发直接复用进行中的 Promise，杜绝重复提交
     async runBusy(key, fn) {
       if (this.pending[key]) return this.pending[key]
@@ -363,6 +389,36 @@ export const useHrStore = defineStore('hr', {
         await this.refresh()
         return r
       } catch (e) { this.notify('error', e.message); return null }
+    },
+    // ---------------- 候选人入职交接 ----------------
+    startOnboarding(appId, expectedAt) {
+      return this.runBusy(`ob-start:${appId}`, () =>
+        this.api('POST', '/onboarding/start', { application_id: appId, expected_onboard_at: expectedAt || '' },
+          { success: '已发起入职交接，进入资料确认' }))
+    },
+    updateOnboardingMaterial(id, payload) {
+      return this.runBusy(`ob-mat:${id}`, () =>
+        this.api('POST', `/onboarding/${id}/material`, payload))
+    },
+    reportOnboarding(id, payload) {
+      return this.runBusy(`ob-report:${id}`, () =>
+        this.api('POST', `/onboarding/${id}/report`, payload, { success: '已确认报到，进入试用交接' }))
+    },
+    delayOnboarding(id, payload) {
+      return this.runBusy(`ob-delay:${id}`, () =>
+        this.api('POST', `/onboarding/${id}/delay`, payload, { success: '报到延期已登记并通知用人经理' }))
+    },
+    updateHandover(id, payload) {
+      return this.runBusy(`ob-hd:${id}:${payload.key}:${Date.now()}`, () =>
+        this.api('POST', `/onboarding/${id}/handover`, payload))
+    },
+    completeOnboarding(id, version) {
+      return this.runBusy(`ob-done:${id}`, () =>
+        this.api('POST', `/onboarding/${id}/complete`, { version }, { success: '入职交接全部完成' }))
+    },
+    cancelOnboarding(id, payload) {
+      return this.runBusy(`ob-cancel:${id}`, () =>
+        this.api('POST', `/onboarding/${id}/cancel`, payload, { success: '入职交接已取消' }))
     }
   }
 })

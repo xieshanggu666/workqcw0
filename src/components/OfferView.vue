@@ -46,6 +46,13 @@ function setStatus(a, status) {
   if (!isRecruiter.value) { store.notify('error', '该操作需「招聘负责人」身份'); return }
   store.setOffer(a.offer.id, status, a.version)
 }
+// 已接受 Offer（录用）→ 入职交接：先跳转到入职交接页并由该页发起（统一资料确认入口）
+function openOnboarding(a) {
+  if (!isRecruiter.value) { store.notify('error', '发起交接需「招聘负责人」身份'); return }
+  store.goView('onboarding')
+  store.notify('success', `请在「入职交接」页为 ${a.candidate} 发起交接`)
+}
+function gotoOnboarding() { store.goView('onboarding') }
 function withdraw(a) {
   if (!isRecruiter.value) { store.notify('error', '该操作需「招聘负责人」身份'); return }
   store.updateOffer(a.offer.id, { status: 'withdrawn', version: a.version, note: 'HR 撤回 Offer' }, 'Offer 已撤回')
@@ -109,6 +116,15 @@ function busy(id) { return !!store.pending[`offer:${id}`] }
                 <button class="primary sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="setStatus(a, 'joined')">确认入职</button>
                 <button class="warn sm" :disabled="busy(a.offer.id) || !isRecruiter" @click="withdraw(a)">撤回</button>
               </template>
+              <!-- 已接受/已入职：发起四阶段入职交接，或展示交接进度入口 -->
+              <button v-if="['accepted','joined'].includes(a.offer.status) && !store.activeOnboardingOf(a.id)"
+                      class="succ sm" :disabled="!isRecruiter"
+                      :title="isRecruiter ? '发起四阶段入职交接（资料确认→审批→报到→试用交接）' : '需「招聘负责人」身份'"
+                      @click="openOnboarding(a)">🧳 发起交接</button>
+              <button v-else-if="['accepted','joined'].includes(a.offer.status) && store.activeOnboardingOf(a.id)"
+                      class="ghost sm" @click="gotoOnboarding">
+                🧳 交接·{{ store.activeOnboardingOf(a.id).status_label }}
+              </button>
               <!-- 已撤回/已拒绝：在 Offer 阶段时可重新发起 -->
               <button v-else-if="['withdrawn','rejected'].includes(a.offer.status) && a.stage === 'offer'" class="succ sm" @click="openMake(a)">重新发起</button>
             </div>

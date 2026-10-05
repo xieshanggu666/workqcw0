@@ -16,7 +16,8 @@ const STAGE_LABEL = { submitted: '投递', screening: '筛选', interview: '面�
 const TYPE_META = {
   stage_advance: { icon: '🔄', label: '候选人推进', submitRole: 'recruiter' },
   interview_conclusion: { icon: '💬', label: '面试结论', submitRole: 'interviewer' },
-  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' }
+  offer_issue: { icon: '📄', label: 'Offer 发放', submitRole: 'recruiter' },
+  onboarding_start: { icon: '🧳', label: '入职交接', submitRole: 'recruiter' }
 }
 const STATUS_META = {
   pending: ['⏳', '审批中', 'var(--accent2)'],
@@ -50,6 +51,7 @@ function payloadSummary(t) {
   if (t.type === 'stage_advance') return `推进「${STAGE_LABEL[p.from_stage] || p.from_stage} → ${STAGE_LABEL[p.target_stage] || p.target_stage}」`
   if (t.type === 'interview_conclusion') return `「${p.round}」结论：${p.conclusion === 'pass' ? '✅ 通过' : '❌ 不通过'}`
   if (t.type === 'offer_issue') return `月薪 ¥${Number(p.salary || 0).toLocaleString()}${p.note ? ` · ${p.note}` : ''}`
+  if (t.type === 'onboarding_start') return `入职交接审批（资料已确认，预计报到 ${p.expected_onboard_at ? String(p.expected_onboard_at).replace('T', ' ').slice(0, 10) : '待定'}）`
   return ''
 }
 // 审批链节点展示：提交 → 各级审批；当前等待节点高亮
@@ -104,9 +106,9 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
   <div class="approval">
     <!-- 角色权限说明：当前身份决定可发起的申请类型与可审批的节点 -->
     <div class="role-banner card">
-      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
+      <span v-if="myRole === 'recruiter'">🧭 当前身份「招聘负责人」：可提请<b>候选人推进</b>、发起<b>Offer 发放</b>与<b>入职交接</b>申请，并审批面试官提交的<b>面试结论</b>；超带宽 Offer 由您终审。</span>
       <span v-else-if="myRole === 'interviewer'">💬 当前身份「面试官」：可提交<b>面试结论</b>申请（通过/不通过），由招聘负责人审批后生效。</span>
-      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>与<b>Offer 发放</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
+      <span v-else>🏢 当前身份「用人经理」：审批<b>候选人推进</b>、<b>Offer 发放</b>与<b>入职交接</b>申请；可退回并附意见，申请人修改后可重新提交。</span>
     </div>
 
     <div class="stat-row">
@@ -227,6 +229,7 @@ const fmtTime = t => t ? String(t).replace('T', ' ').slice(0, 16) : ''
             <button class="danger" :class="{ on: resubmitConclusion === 'fail' }" @click="resubmitConclusion = 'fail'">❌ 不通过</button>
           </div>
         </template>
+        <p class="muted" v-else-if="resubmitTarget.type === 'onboarding_start'">请在「入职交接」页面补充/修正入职资料确认后重新提交，审批链仍为用人经理单级审批。</p>
         <p class="muted" v-else>推进目标阶段不可修改，确认后将重新提交审批。</p>
         <div class="acts" style="margin-top:12px">
           <button class="primary" :disabled="busy(resubmitTarget.id)" @click="confirmResubmit">重新提交</button>

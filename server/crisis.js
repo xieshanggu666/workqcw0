@@ -6,6 +6,7 @@ import express from 'express'
 import crypto from 'node:crypto'
 import db, { ts } from './db.js'
 import { suspendAppointmentsForIncident } from './schedule.js'
+import { cancelOnboardingForFlow } from './onboarding.js'
 
 export const router = express.Router()
 
@@ -47,6 +48,11 @@ export const ACTION_LABEL = {
   'state.rollback': '流程状态回退', 'state.reject': '流程淘汰',
   'schedule.suspend': '预约同步挂起', 'schedule.rebook': '预约重约恢复', 'schedule.confirmed': '预约确认恢复',
   'approval.auto_cancel': '待审任务同步撤销', 'notification.sync_read': '未读通知同步归并',
+  'onboarding.cancel': '入职交接同步取消',
+  'onboarding.start': '发起入职交接', 'onboarding.submit': '交接提交审批', 'onboarding.approve': '交接审批通过',
+  'onboarding.return': '交接审批退回', 'onboarding.resubmit': '交接修改重提', 'onboarding.cancel_task': '交接审批撤销',
+  'onboarding.material': '交接资料确认', 'onboarding.report': '候选人报到', 'onboarding.delay': '报到延期',
+  'onboarding.ready': '交接项备齐', 'onboarding.confirm': '交接项确认', 'onboarding.complete': '交接完成',
   'approval.execute': '审批执行回写', 'approval.failed': '审批执行失败',
   'ticket.create': '创建工单', 'ticket.assign': '工单改派', 'ticket.transition': '工单流转',
   'report.finalize': '复盘定稿'
@@ -384,7 +390,7 @@ router.post('/grants/:gid/revoke', wrap((req, res) => {
 
 // ---------------- 危机状态回退（跨角色紧急处置，复用主流程状态机） ----------------
 // 三类审批任务的可读名（同步撤销待审任务时留痕/通知用）
-const TASK_TYPE_LABEL = { stage_advance: '候选人推进', interview_conclusion: '面试结论', offer_issue: 'Offer 发放' }
+const TASK_TYPE_LABEL = { stage_advance: '候选人推进', interview_conclusion: '面试结论', offer_issue: 'Offer 发放', onboarding_start: '入职交接' }
 
 // 同步撤销该应聘全部「待审批」任务（退回态保留，由申请人自行决定重提/撤销）：
 // 任务状态、步骤留痕与业务回退在同一事务内完成；返回被撤销任务清单供上链
@@ -407,12 +413,12 @@ function cancelPendingTasksForIncident(appId, { actor, reason }) {
   return cancelled
 }
 
-// 归并该应聘的在途未读通知：预约协商（sched_*）与审批待办（task_*）已随回退失效，
-// 直接标记已读避免铃铛/红点残留；危机处置类通知保留未读（仍是处置待办）。返回按类型计数
+// 归并该应聘的在途未读通知：预约协商（sched_*）、审批待办（task_*）、入职交接（onboarding_*）
+// 已随回退失效，直接标记已读避免铃铛/红点残留；危机处置类通知保留未读（仍是处置待办）。返回按类型计数
 function syncUnreadNotificationsForIncident(appId) {
   const rows = db.prepare(`SELECT id,type,recipient_role FROM notifications
                            WHERE application_id=? AND is_read=0
-                             AND (type LIKE 'sched_%' OR type LIKE 'task_%')`).all(num(appId))
+                             AND (type LIKE 'sched_%' OR type LIKE 'task_%' OR type LIKE 'onboarding_%')`).all(num(appId))
   if (rows.length) {
     const marks = rows.map(() => '?').join(',')
     db.prepare(`UPDATE notifications SET is_read=1 WHERE id IN (${marks})`).run(...rows.map(r => r.id))
@@ -474,7 +480,9 @@ router.post('/incidents/:id/rollback', wrap((req, res) => {
     }
 
     // 3) 同步撤销待审批任务：回退后申请内容对应的业务前置已失效，终审执行必然漂移，统一撤销留痕
+    //    （进行中的入职交接审批已由交接取消器在其内部同步撤销，故这里排除 onboarding_start 避免重复）
     const cancelledTasks = cancelPendingTasksForIncident(appId, { actor: actorOf(user), reason })
+      .filter(t => t.type !== 'onboarding_start')
     appendEntry(inc.id, {
       category: 'decision', action: 'approval.auto_cancel', actor: actorOf(user),
       refType: 'approval',
@@ -497,28 +505,51 @@ router.post('/incidents/:id/rollback', wrap((req, res) => {
       })
     })
 
-    // 4) 未读通知归并：失效的预约/审批未读提醒统一已读，铃铛/红点不再残留旧待办
+    // 3.5) 进行中的入职交接已失去前提：静默取消（同步撤销关联审批、追加交接留痕）。
+    //      放在「未读通知归并」之后，避免本次发出的危机通知被归并为已读
+    const obCancelled = cancelOnboardingForFlow(appId, { actor: actorOf(user), reason, silent: true, via: 'crisis_rollback' })
+
+    // 4) 未读通知归并：失效的预约/审批/交接未读提醒统一已读，铃铛/红点不再残留旧待办
     const readSync = syncUnreadNotificationsForIncident(appId)
     appendEntry(inc.id, {
       category: 'action', action: 'notification.sync_read', actor: actorOf(user),
       refType: 'notification',
       refId: readSync.ids.slice(0, 50).join(','),
       summary: readSync.count
-        ? `同步归并 ${readSync.count} 条失效的预约/审批未读通知为已读`
+        ? `同步归并 ${readSync.count} 条失效的预约/审批/交接未读通知为已读`
         : '无失效的未读通知需要归并',
       detail: { application_id: appId, count: readSync.count, notification_ids: readSync.ids, by_type: readSync.by_type }
     })
 
+    if (obCancelled) {
+      appendEntry(inc.id, {
+        category: 'rollback', action: 'onboarding.cancel', actor: actorOf(user),
+        refType: 'onboarding', refId: obCancelled.id,
+        summary: `入职交接随危机回退取消（原阶段：${obCancelled.from}）`,
+        detail: {
+          application_id: appId, onboarding_id: obCancelled.id, from: obCancelled.from,
+          linked_task: obCancelled.linkedTask, reason
+        }
+      })
+      notifyAllRoles('crisis_onboarding_cancelled', {
+        title: `🚫 ${inc.code} 入职交接已随危机回退取消`,
+        body: `「交接 #${obCancelled.id}」因流程危机回退（${reason}）被同步取消，流程恢复录用后可重新发起`,
+        appId, incidentId: inc.id, owner: { id: inc.commander_id, name: inc.commander_name }
+      })
+    }
+
     notifyAllRoles('crisis_rollback', {
       title: `⏪ ${inc.code} 执行状态回退（已同步后续协同）`,
       body: `${user.name} 因「${reason}」将应聘流程从「${r.fromLabel}」回退到「${r.toLabel}」`
-        + `：挂起预约 ${suspended.length} 个、撤销待审 ${cancelledTasks.length} 个、归并未读 ${readSync.count} 条`,
+        + `：挂起预约 ${suspended.length} 个、撤销待审 ${cancelledTasks.length} 个、`
+        + `${obCancelled ? '取消入职交接 1 单、' : ''}归并未读 ${readSync.count} 条`,
       appId, incidentId: inc.id, owner: { id: inc.commander_id, name: inc.commander_name }
     })
     return {
       ok: true, ...r, revived,
       appointments_suspended: suspended,
       tasks_cancelled: cancelledTasks,
+      onboarding_cancelled: obCancelled ? { id: obCancelled.id, from: obCancelled.from } : null,
       notifications_read: readSync.count
     }
   })

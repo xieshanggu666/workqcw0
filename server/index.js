@@ -4,6 +4,10 @@ import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
 import { router as scheduleRouter, getScheduleState } from './schedule.js'
+import {
+  router as onboardingRouter, bindOnboardingCore, getOnboardingState,
+  onboardingHooks, cancelOnboardingForFlow
+} from './onboarding.js'
 
 const app = express()
 app.use(express.json())
@@ -67,13 +71,31 @@ function rollbackForIncident(applicationId, operatorName, reason) {
   }
 }
 
+// 入职交接模块报到执行器：在交接模块事务内把已接受的 Offer 回写为「已入职」，
+// 与 Offer 页「确认入职」共用同一条 Offer 变更路径（只追加留痕；应用已在录用阶段，不再驱动状态机）
+function markOfferJoined(applicationId, { joinedAt, operator } = {}) {
+  const a = db.prepare('SELECT * FROM applications WHERE id=?').get(num(applicationId))
+  if (!a) badRequest('关联应聘记录不存在', 'app_missing')
+  const of = offerOfApp(a.id)
+  if (!of) badRequest('该候选人没有 Offer 记录，无法确认入职', 'offer_missing')
+  if (of.status === 'joined') return { changed: false, already: true, offerId: of.id }
+  if (of.status !== 'accepted') badRequest(`Offer 当前为「${of.status}」，不能确认报到`, 'offer_not_accepted')
+  const stamp = joinedAt || ts()
+  db.prepare('UPDATE offers SET status=?, joined_at=COALESCE(NULLIF(joined_at,\'\'),?), decided_at=? WHERE id=?')
+    .run('joined', stamp, stamp, of.id)
+  addOfferLog({ offerId: of.id, applicationId: a.id, changeType: 'join', of: { ...of, status: 'accepted' }, toStatus: 'joined', operator: operator || a.recruiter || 'HR-Sandy', note: '入职交接：候选人报到确认' })
+  of.status = 'joined'; of.joined_at = stamp
+  return { changed: true, already: false, offerId: of.id }
+}
+
 // ---------------- 角色与审批链 ----------------
 const ROLE_LABEL = { recruiter: '招聘负责人', interviewer: '面试官', hiring_manager: '用人经理' }
 // 三类需审批的关键动作及其允许的发起角色；审批链在提交时按类型（+动态规则）固化
 const TASK_TYPES = {
   stage_advance: { label: '候选人推进', submitRole: 'recruiter' },
   interview_conclusion: { label: '面试结论', submitRole: 'interviewer' },
-  offer_issue: { label: 'Offer 发放', submitRole: 'recruiter' }
+  offer_issue: { label: 'Offer 发放', submitRole: 'recruiter' },
+  onboarding_start: { label: '入职交接', submitRole: 'recruiter' }
 }
 
 // 身份解析：前端每次请求带 x-user-id；缺省回退招聘负责人，保证旧调用兼容
@@ -87,6 +109,7 @@ function currentUser(req) {
 function buildChain(type, payload, app) {
   if (type === 'stage_advance') return [{ role: 'hiring_manager' }]
   if (type === 'interview_conclusion') return [{ role: 'recruiter' }]
+  if (type === 'onboarding_start') return [{ role: 'hiring_manager' }]
   if (type === 'offer_issue') {
     const chain = [{ role: 'hiring_manager' }]
     const pos = db.prepare('SELECT salary_max FROM positions WHERE id=?').get(app.position_id)
@@ -447,12 +470,17 @@ app.get('/api/state', (req, res) => {
       offerLogs: offerLogs.filter(l => l.application_id === a.id)
     }
   })
+  // 入职交接模块数据与应聘记录联动（新模块独立查询，避免影响既有望远镜构建）
+  const obState = getOnboardingState()
+  const obOfApp = new Map(obState.onboardings.filter(o => o.active).map(o => [o.application_id, o]))
+  pipelines.forEach(a => { a.onboarding = obOfApp.get(a.id) ? { id: obOfApp.get(a.id).id, status: obOfApp.get(a.id).status, status_label: obOfApp.get(a.id).status_label } : null })
   res.json({
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
     ...getCrisisState(),
-    ...getScheduleState()
+    ...getScheduleState(),
+    ...obState
   })
 })
 
@@ -862,6 +890,13 @@ app.post('/api/applications/:id/rollback', (req, res, next) => {
       const offerBefore = offerOfApp(a.id)
       const r = rollbackStage(a, { operator: b.operator, expectedVersion: b.version, reason: b.reason || '' })
       if (a.stage === 'rejected') db.prepare("UPDATE applications SET reject_from='' WHERE id=?").run(id)
+      // 录用阶段回退（撤回已接受 Offer）：进行中的入职交接已失去前提，同事务取消并通知双方角色
+      let obCancelled = null
+      if (fromStage === 'hired') {
+        obCancelled = cancelOnboardingForFlow(id, {
+          actor, reason: b.reason || '录用阶段异常回退，入职交接同步取消', via: 'flow_rollback'
+        })
+      }
       const offerAfter = offerOfApp(a.id)
       // 若该应聘关联了进行中的危机事件，状态回退同事务追加到不可篡改审计链
       auditPassive({
@@ -1090,8 +1125,13 @@ app.post('/api/offers/:id', (req, res, next) => {
           db.prepare('UPDATE offers SET status=?, decided_at=?, decided_by=?, note=? WHERE id=?')
             .run('withdrawn', stamp, operator, b.note || of.note, offerId)
           addOfferLog({ offerId, applicationId: a.id, changeType: 'withdraw', of, toStatus: 'withdrawn', operator, note: b.note || '' })
-          // 已接受/已入职后撤回：录用阶段同步回退到 Offer（单步回退，事件留痕）
-          if (a.stage === 'hired') moved = moveStage(a, 'offer', { eventType: 'rollback', operator, fromStage: 'hired' })
+          // 已接受/已入职后撤回：录用阶段同步回退到 Offer（单步回退，事件留痕），入职交接同事务取消
+          if (a.stage === 'hired') {
+            moved = moveStage(a, 'offer', { eventType: 'rollback', operator, fromStage: 'hired' })
+            cancelOnboardingForFlow(a.id, {
+              actor: currentUser(req), reason: b.note || '已接受 Offer 被撤回，录用回退，入职交接同步取消', via: 'offer_withdraw'
+            })
+          }
         }
       }
       return { ok: true, status: b.status || of.status, stage: a.stage, version: num(a.version), moved: !!moved }
@@ -1122,6 +1162,11 @@ function executeApprovalTask(task, actor) {
   if (task.type === 'offer_issue') {
     issueOffer(a, { salary: payload.salary, due: payload.due, note: payload.note, operator: actor.name })
     return { desc: `Offer 已发放（月薪 ¥${num(payload.salary).toLocaleString()}，待候选人回应）`, version: a.version }
+  }
+  if (task.type === 'onboarding_start') {
+    // 终审通过在同一事务内驱动交接从审批阶段进入报到阶段（报到动作才回写 Offer 为已入职）
+    const r = onboardingHooks.execute(task, actor)
+    return { desc: r.desc, version: r.version }
   }
   badRequest('未知审批类型', 'unknown_task_type')
 }
@@ -1180,6 +1225,19 @@ app.post('/api/approvals', (req, res, next) => {
         payload.due = String(b.payload?.due || '')
         payload.note = String(b.payload?.note || '')
         summary = `月薪 ¥${salary.toLocaleString()}`
+      } else if (type === 'onboarding_start') {
+        // 入职交接审批：必须已存在交接单且资料确认完成（钩子内严格复核）；任务创建后驱动进入审批阶段
+        const ob = db.prepare("SELECT * FROM onboardings WHERE application_id=? AND status!='cancelled' ORDER BY id DESC LIMIT 1")
+          .get(a.id)
+        if (!ob) badRequest('请先在「入职交接」中发起交接并完成资料确认', 'onboarding_missing')
+        const mItems = parseJSON(ob.material_items, [])
+        const allMat = mItems.length > 0 && mItems.every(i => num(i.confirmed))
+        if (ob.status !== 'material' || !num(ob.candidate_confirmed) || !allMat) {
+          conflict('请先逐项确认入职资料并取得候选人确认，再提交交接审批', 'material_incomplete')
+        }
+        payload.expected_onboard_at = ob.expected_onboard_at
+        payload.onboarding_id = ob.id
+        summary = `入职交接审批（预计报到 ${ob.expected_onboard_at || '待定'}）`
       }
 
       const chain = buildChain(type, payload, a)
@@ -1190,6 +1248,8 @@ app.post('/api/approvals', (req, res, next) => {
         .run(type, a.id, interviewId, JSON.stringify(payload), JSON.stringify(chain), user.id, user.name, user.role, ts())
       const taskId = Number(r.lastInsertRowid)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'submit', actor: user, note: summary })
+      // 入职交接：任务落库后在同一事务内驱动交接进入审批阶段
+      if (type === 'onboarding_start') onboardingHooks.submit(taskId, a, user)
       notify({
         recipientRole: chain[0].role, type: 'task_submitted',
         title: `新的${meta.label}审批待处理`,
@@ -1232,6 +1292,8 @@ app.post('/api/approvals/:id/decide', (req, res, next) => {
         db.prepare("UPDATE approval_tasks SET status='returned', decided_at=?, decide_note=?, version=version+1 WHERE id=?")
           .run(ts(), note, taskId)
         addStep(taskId, { stepNo: t.current_step, role: user.role, action: 'return', actor: user, note })
+        // 入职交接被退回：交接回到资料确认，待补充后重新提交
+        if (t.type === 'onboarding_start') onboardingHooks.returned(t, user, note)
         notify({
           recipientRole: t.submitted_role, type: 'task_returned',
           title: `${meta.label}审批被退回`,
@@ -1348,11 +1410,15 @@ app.post('/api/approvals/:id/resubmit', (req, res, next) => {
           badRequest(`流程阶段已变化（当前「${STAGE_LABEL[a.stage]}」），该申请已失效，请撤销后重新发起`, 'stage_mismatch')
         }
         summary = '重新提交推进申请'
+      } else if (t.type === 'onboarding_start') {
+        // 重提前由钩子复核资料确认是否补齐；通过后交接重新进入审批阶段
+        summary = '重新提交入职交接审批'
       }
       const chain = buildChain(t.type, payload, a)
       db.prepare("UPDATE approval_tasks SET payload=?, chain=?, current_step=0, status='pending', submitted_at=?, decide_note='', version=version+1 WHERE id=?")
         .run(JSON.stringify(payload), JSON.stringify(chain), ts(), taskId)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'resubmit', actor: user, note: summary })
+      if (t.type === 'onboarding_start') onboardingHooks.resubmitted({ ...t, payload: JSON.stringify(payload) }, user)
       const cand = db.prepare('SELECT name FROM candidates WHERE id=?').get(a.candidate_id)
       const pos = db.prepare('SELECT name FROM positions WHERE id=?').get(a.position_id)
       notify({
@@ -1380,6 +1446,8 @@ app.post('/api/approvals/:id/cancel', (req, res, next) => {
       if (t.submitted_by !== user.id) forbidden('仅原申请人可以撤销该任务', 'not_submitter')
       db.prepare("UPDATE approval_tasks SET status='cancelled', decided_at=?, version=version+1 WHERE id=?").run(ts(), taskId)
       addStep(taskId, { stepNo: -1, role: user.role, action: 'cancel', actor: user, note: String(req.body?.note || '') })
+      // 入职交接审批撤销：交接回到资料确认（区别于整单取消，候选人仍在录用流程内）
+      if (t.type === 'onboarding_start') onboardingHooks.taskCancelled(t, user, String(req.body?.note || ''))
       if (t.status === 'pending') {
         const chain = parseJSON(t.chain, [])
         const meta = TASK_TYPES[t.type]
@@ -1512,6 +1580,9 @@ bindCrisisCore({ rollbackForIncident })
 app.use('/api/crisis', crisisRouter)
 // 候选人↔面试官双向预约沟通（可用时段/双向确认改期/提醒/缺席处理）
 app.use('/api/schedule', scheduleRouter)
+// 候选人入职交接（资料确认 → 审批 → 报到 → 试用交接），注入 Offer 回写执行器
+bindOnboardingCore({ markOfferJoined })
+app.use('/api/onboarding', onboardingRouter)
 
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars
